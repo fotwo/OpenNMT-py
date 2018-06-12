@@ -8,34 +8,308 @@ import glob
 import os
 import sys
 from datetime import datetime
+import random
 
 import torch
+from torch import cuda
 import torch.nn as nn
 import onmt
 import onmt.ModelConstructorForMultiEncoder
+from onmt.TrainerForMultiEncoder import TrainerForMultiEncoder
 
 from onmt.io.TextDataset import TextDataset
+from onmt.io.AudioDataset import AudioDataset
 from onmt.Utils import use_gpu
 
 
+
+def data_opts(parser):
+    group=parser.add_argument_group('Data - Pretrained Embeddings')
+    group.add_argument('-pre_word_vecs_enc',
+                       help='''If a valid path is specified, then this will
+                       load pretrained word embeddings on the encoder side.
+                       See README for specific formatting instructions.''')
+    group.add_argument('-pre_word_vecs_dec',
+                       help='''If a valid path is specified, then this will
+                       load pretrained embeddings on the decoder side.
+                       See README for specific formatting instructions.''')
+    group.add_argument('-fix_word_vecs_enc',
+                       action='store_true',
+                       help='''Fix word embeddings on the encoder side.''')
+    group.add_argument('-fix_word_vecs_dec',
+                       action='store_true',
+                       help='''Fix word embeddings on the decoder side.''')
+
+
+    group=parser.add_argument_group('Data - Speech')
+    group.add_argument('-sample_rate',type=int,default=16000,
+                       help='''Sample rate.''')
+    group.add_argument('-window_size',type=float,default=0.02,
+                       help='''Window size for spectrogram in seconds.''')
+
+
 def train_opts(parser):
-    parser.add_argument('-data', required=True,
-                        help='''Path to input data.''')
-    parser.add_argument('-save_model', required=True,
-                        help='''Path to save model.''')
-    pass
+    group=parser.add_argument_group('General')
+    group.add_argument('-data', required=True,
+                       help='''Path to input data.''')
+    group.add_argument('-save_model', default='model',
+                       help='''Path to save model.''')
+    group.add_argument('-gpuid',default=[],nargs='+',type=int,
+                       help='''Use CUDA on the listed devices.''')
+    group.add_argument('-seed',type=int,default=-1,
+                       help='''Random seed used for the experiments reproducibility.''')
+
+    # Initialization options.
+    group=parser.add_argument_group('Initialization.')
+    group.add_argument('-start_epoch',type=int,default=1,
+                       help='''The epoch from which to start.''')
+    group.add_argument('-param_init',type=float,default=0.1,
+                       help='''Parameters are initialized over uniform distribution
+                       with support (-param_init, param_init).
+                       Use 0 to not use initialization.''')
+    group.add_argument('-param_init_glorot',action='store_true',
+                       help='''Init parameters with xavier_uniform. Required for transformer.''')
+    group.add_argument('-train_from',type=str, default='',
+                       help='''If training from a checkpoint then this is the path to the
+                       pretrained model's state_dict.''')
 
 
 def model_opts(parser):
+    '''
+    These options are passed to the construction of the model.
+    Be careful with these as they will be used during translation.
+    '''
+    group=parser.add_argument_group('Model - Embeddings')
+    group.add_argument('-src_word_vec_size',type=int,default=500,
+                       help='''Word embedding size of src.''')
+    group.add_argument('-tgt_word_vec_size',type=int,default=500,
+                       help='''Word embedding size of tgt.''')
+    group.add_argument('-word_vec_size',type=int,default=-1,
+                       help='''Word embedding size for src and tgt.''')
+    group.add_argument('-position_encoding',action='store_true',
+                       help='''Use as sin to mark relative words position.
+                       Necessary for non-RNN style models.''')
+    group.add_argument('-share_embeddings',action='store_true',
+                       help='''Share the word embeddings between encoder
+                       and decoder. Need to use shared dictionary
+                       for this option. Not implemented.''')
+    group.add_argument('-share_decoder_embeddings',action='store_true',
+                       help='''Use a shared weight matrix for the input and
+                       output word embeddings in the decoder.''')
+
+
+    group=parser.add_argument_group('Model - Embedding Features.')
+    group.add_argument('-feat_merge',type=str,default='concat',
+                       choices=['concat','sum','mlp'],
+                       help='''Merge action for incorporating features embedding.
+                       Options [concat|sum|mlp].''')
+    group.add_argument('-feat_vec_size',type=int,default=-1,
+                       help='''If specified, feature embedding sizes
+                       will be set to this. Otherwise, feat_vec_exponent
+                       will be used.''')
+    group.add_argument('-feat_vec_exponent',type=float,default=0.7,
+                       help='''If -feat_merge_size is not set, feature embedding sizes
+                       will be set to N^feat_vec_exponent
+                       where N is the size of dictionary belonging to that feature.''')
+
+
+    group=parser.add_argument_group('Model - MultiEncoder-Decoder')
+    group.add_argument('-model_type',default='multiencoder',
+                       help='''Type of encoder model to use.
+                       Here we only only only support text-audio multiencoder.
+                       So the value must be 'multiencoder'.''')
+    group.add_argument('-encoder_type', type=str, default='rnn',
+                       choices=['rnn', 'brnn'],
+                       help='''Type of encoder layer to use.
+                       Need more work to expend the options.[rnn|brnn].''')
+    group.add_argument('-decoder_type',type=str,default='rnn',
+                       choices=['rnn'],
+                       help='''Type of decoder layer to use.
+                       Need more work to expand the options.[rnn].''')
+    group.add_argument('-layers',type=int,default=-1,
+                       help='''Number of layers in enc/dec.''')
+    group.add_argument('-enc_layers',type=int,default=2,
+                       help='''Number of layers in encoder.''')
+    group.add_argument('-dec_layers',type=int,default=2,
+                       help='''Number of layers in decoder.''')
+    group.add_argument('-rnn_size',type=int,default=500,
+                       help='''Size of rnn hidden states.''')
+    group.add_argument('-cnn_kernel_width',type=int,default=3,
+                       help='''Size of windows in the cnn, the kernel_size
+                       is (cnn_kernel_width, 1) in conv layer.''')
+
+    group.add_argument('-input_feed',type=int,default=1,
+                       help='''Feed the context vector at each time step
+                       as additional input (via concatenating with the
+                       word embeddings) to the decoder.''')
+    group.add_argument('-bridge',action='store_true',
+                       help='''Have an additional layer between the last
+                       encoder state and the first decoder state.''')
+    group.add_argument('-rnn_type',type=str,default='LSTM',
+                       choices=['LSTM','GRU'],
+                       help='''The gate type to use in the RNNs.''')
+    group.add_argument('-brnn',action=DeprecateAction,
+                       help='''Deprecated, use 'encoder_type'.''')
+
+    group.add_argument('-context_gate',type=str,default=None,
+                       help='''Not be used. Need more work.''')
+
+
+    group=parser.add_argument_group('Model - Attention')
+    group.add_argument('-global_attention',type=str,default='multi',
+                       help='''The attention type to use for multiple encoders.
+                       Only implement general method.''')
+
+    group.add_argument('-copy_attn',action='store_true',
+                       help='''Train copy attention layer. Not implemented.''')
+    group.add_argument('-copy_attn_force',action='store_true',
+                       help='''When avaiable, train to copy. Not implemented.''')
+    group.add_argument('-reuse_copy_attn',action='store_true',
+                       help='''Reuse standard attention for copy. Not implemented.''')
+    group.add_argument('-copy_loss_by_seqlength',action='store_true',
+                       help='''Divide copy loss by length of sequence.''')
+    group.add_argument('-converage_attn',action='store_true',
+                       help='''Train a converage attention layer. Not implemented.''')
+    group.add_argument('-lambda_coverage',type=float,default=1,
+                       help='''Lambda value for coverage.''')
+
+def optim_opts(parser):
+    group=parser.add_argument_group('Optimization')
+    group.add_argument('-batch_size',type=int,default=64,
+                       help='''Maximum batch size for training.''')
+    group.add_argument('-batch_type',default='sents',
+                       choices=['sents','tokens'],
+                       help='''Batch grouping for batch_size. Standard
+                       is sents. Tokens will do dynamic batching.''')
+    group.add_argument('-normalization',default='sents',
+                       choices=['sents','tokens'],
+                       help='''Normalization method of the gradient.''')
+    group.add_argument('-accum_count',type=int,default=1,
+                       help='''Accumulate gradient this many times.
+                       Approximately equivalent to updating
+                       batch_size * accum_count batches at once.
+                       Recommanded for Transformer.''')
+    group.add_argument('-valid_batch_size',type=int,default=32,
+                       help='Maximum batch size for validation.')
+    group.add_argument('-max_generator_batches',type=int,default=32,
+                       help='''Maximum batches of words in a sequence
+                        to run the generator on in parallel. Higher
+                        is faster, but uses more memory.''')
+    group.add_argument('-epochs',type=int,default=13,
+                       help='''Number of training epochs.''')
+    group.add_argument('-optim',default='sgd',
+                       choices=['sgd','adagrad','adadelta', 'adam',
+                                'sparseadam'],
+                       help='''Optimization method.''')
+    group.add_argument('-adagrad_accumulator_init',type=float,default=0,
+                       help='''Initializes the accumulator values in adagrad.
+                       Mirrors the initial_accumulator_value option
+                       in the tensorflow adagrad (use 0.1 for their default).''')
+    group.add_argument('-max_grad_norm',type=float,default=5,
+                       help='''If the norm of the gradient vector exceeds this,
+                       renormalize it to have the norm equal to max_grad_norm.''')
+    group.add_argument('-dropout',type=float,default=0.3,
+                       help='''Dropout probability; applied in LSTM stacks.''')
+    group.add_argument('-truncated_decoder',type=int,default=0,
+                       help='''Truncated bptt.''')
+    group.add_argument('-adam_beta1',type=float,default=0.9,
+                       help='''The beta1 parameter used by Adam.
+                       Almost without exception a value of 0.9 is used in
+                       the literature, seemingly giving good results,
+                       so we would discourge changing this value from the
+                       default without due consideration.''')
+    group.add_argument('-adam_beta2',type=float,default=0.999,
+                       help='''The beta2 parameter used by Adam.
+                       Typically a value of 0.999 is recommended, as
+                       this is the value suggested by the original paper
+                       describing Adam, and is also the value adopted in other
+                       frameworks, such as tensorflow and keras.
+                       Whereas recently the paper 'Attention is All You Need'
+                        suggested a value of 0.98 for beta2, this parameter may
+                        not work well for normal models / default baselines.''')
+    group.add_argument('-label_smoothing',type=float,default=0.0,
+                       help='''Label smoothing value epsilon.
+                       Probabilities of all non-true labels
+                       will be smoothed by epsilon / (vocab_size -1).
+                       Set to zero to turn off label smoothing.''')
+
+
+    group=parser.add_argument_group('Optimization - Rate')
+    group.add_argument('-learning_rate', type=float, default=1.0,
+                       help='''Starting learning rate.
+                       Recommended settings: sgd = 1, adagrad = 0.1,
+                       adadelta = 1, adam = 0.001''')
+    group.add_argument('-learning_rate_decay',type=float,default=0.5,
+                       help='''If update_learning_rate, decay learning rate
+                       by this if (i) perplexity does not decrease on the
+                       validation set or (ii) epoch has gone past start_decay_at.''')
+    group.add_argument('-start_decay_at',type=int,default=8,
+                       help='''Start decaying every epoch after and including
+                       this epoch.''')
+    group.add_argument('-start_checkpoint_at',type=int,default=0,
+                       help='''Start checkpointing every epoch after and
+                       in this epoch.''')
+    group.add_argument('-decay_method',type=str,default='',
+                       choices=['noam'], help='''Use a custom decay rate.''')
+    group.add_argument('-warmup_steps',type=int,default=4000,
+                       help='''Number of warmup steps for custom decay.''')
+
+
+def log_opts(parser):
+    group = parser.add_argument_group('Logging')
+    group.add_argument('-tensorboard', action='store_true',
+                       help='''Use tensorboardX for visualization during training.
+                       Must have the library tensorboardX.''')
+    group.add_argument('-tensorboard_log_dir',type=str,
+                       default='exp/tmp',
+                       help='''Log directory for Tensorboard.
+                       This is also the name of the run.''')
     pass
+
+
+class DeprecateAction(argparse.Action):
+    def __init__(self, option_strings, dest, help=None, **kwargs):
+        super(DeprecateAction, self).__init__(option_strings, dest, nargs=0,
+                                              help=help, **kwargs)
+
+    def __call__(self, parser, namespace, values, flag_name):
+        help = self.help if self.help is not None else ""
+        msg = "Flag '%s' is deprecated. %s" % (flag_name, help)
+        raise argparse.ArgumentTypeError(msg)
 
 
 parser = argparse.ArgumentParser(description='train_multiencoder.py',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+data_opts(parser)
 train_opts(parser)
 model_opts(parser)
+optim_opts(parser)
+log_opts(parser)
+
 
 opt = parser.parse_args()
+
+
+if opt.layers != -1:
+    opt.enc_layers=opt.layers
+    opt.dec_layers=opt.layers
+
+if opt.seed>0:
+    random.seed(opt.seed)
+    torch.manual_seed(opt.seed)
+
+if torch.cuda.is_available() and not opt.gpuid:
+    print('''WARNING: You have a CUDA device, should run with -gpuid 0.''')
+
+if opt.gpuid:
+    cuda.set_device(opt.gpuid[0])
+    if opt.seed > 0:
+        torch.cuda.manual_seed(opt.seed)
+
+if len(opt.gpuid)>1:
+    sys.stderr.write('''Sorry, multigpu is not supported yet.\n''')
+    sys.exit(1)
 
 
 if opt.tensorboard:
@@ -72,7 +346,7 @@ def tally_parameters(model):
     print('* number of parameters: %d' % n_params)
     enc=0
     dec=0
-    for name, param in model.parameters():
+    for name, param in model.named_parameters():
         if 'encoder' in name:
             enc+=param.nelement()
         elif 'decoder' or 'generator' in name:
@@ -81,9 +355,9 @@ def tally_parameters(model):
     print('decoder: ', dec)
 
 
-def build_multiencoder_model(model_opt, opt, fields):
+def build_multiencoder_model(model_opt, opt, fields_dict):
     print('Building Model...')
-    model=onmt.ModelConstructorForMultiEncoder.make_multiencoder_model(model_opt, fields,
+    model=onmt.ModelConstructorForMultiEncoder.make_multiencoder_model(model_opt, fields_dict,
                                                                        use_gpu(opt))
     if len(opt.gpuid) > 1:
         print('Multi gpu training: ', opt.gpuid)
@@ -168,7 +442,7 @@ def make_dataset_iter(dataset_generator,fields, opt, is_train=True):
     ordered iterator strategy here, but more sophisticated strategy like
     curriculum learning is ok too.
     :param datasets_generator: generator of dataset (vis torch.load) read from '*.pt' files.
-    :param fields:
+    :param fields: dict of fields(dict of :obj:`Fields`) for different source.
     :param opt:
     :param is_train:
     :return:
@@ -237,15 +511,15 @@ class DatasetLazyIter(object):
 
 def train_model(model, fields, optim, data_type, model_opt):
     assert data_type == 'multi'
-    train_loss=make_loss_compute(model,fields['tgt'].vocab,opt)
-    valid_loss=make_loss_compute(model,fields['tgt'].vocab,opt,is_train=False)
+    train_loss=make_loss_compute(model,fields['text']['tgt'].vocab,opt)
+    valid_loss=make_loss_compute(model,fields['text']['tgt'].vocab,opt,is_train=False)
 
     trunc_size=opt.truncated_decoder
     shard_size=opt.max_generator_batches
     norm_method=opt.normalization
-    grad_accum_count=opt.accum_count # Boolean type.
+    grad_accum_count=opt.accum_count # Bool type.
 
-    trainer = onmt.TrainerForMultiEncoder(model, train_loss, valid_loss, optim,
+    trainer = TrainerForMultiEncoder(model, train_loss, valid_loss, optim,
                                      trunc_size, shard_size, data_type,
                                      norm_method, grad_accum_count)
 
@@ -318,26 +592,40 @@ def main():
     vocabs = torch.load(opt.data + '.vocab.pt')  # 'src_text', 'tgt'
     vocabs = dict(vocabs)
     pass
-    # get fields
-    fields = TextDataset.get_fields(0, 0)  # Here we set number of src_features and tgt_features to 0.
+    # get fields, we attempt to use dict to store fields for different encoders(source data).
+    text_fields = TextDataset.get_fields(0, 0)  # Here we set number of src_features and tgt_features to 0.
                                            # Actually, we can use these features, but it need more modifications.
 
-    fields['src_text'] = fields['src']  # Copy key from 'src' to 'src_text'. for assigning the field for text type input.
+    audio_fields = AudioDataset.get_fields(0,0)
+
+    # fields['src_text'] = fields['src']  # Copy key from 'src' to 'src_text'. for assigning the field for text type input.
                                         # the field for audio type input will not be made, i.e., fields['src_audio']=audio_fields['src'].
                                         # Because it will not be used next.
+
     for k, v in vocabs.items():
         v.stoi = defaultdict(lambda: 0, v.stoi)
-        fields[k].vocab = v
+        if k == 'src_text':
+            text_fields['src'].vocab=v
+        else:
+            text_fields['tgt'].vocab=v
+            audio_fields['tgt'].vocab=v
 
-    fields = dict([(k, f) for (k, f) in fields.items()
+
+    text_fields = dict([(k, f) for (k, f) in text_fields.items()
                    if k in ex_generator[0].__dict__])  # 'indices', 'src', 'src_text', 'tgt'
+    audio_fields=dict([(k,f) for (k,f) in audio_fields.items()
+                       if k in ex_generator[0].__dict__])
 
     print(' * vocabulary size. text source = %d; target = %d' %
-          (len(fields['src_text'].vocab), len(fields['tgt'].vocab)))
+          (len(text_fields['src'].vocab), len(text_fields['tgt'].vocab)))
+    print(' * vocabulary size. audio target = %d' %
+          len(audio_fields['tgt'].vocab))
+
+    fields_dict={'text':text_fields,'audio':audio_fields}
     pass
 
     # Build model.
-    model = build_multiencoder_model(model_opt, opt, fields)  # TODO: support using 'checkpoint'.
+    model = build_multiencoder_model(model_opt, opt, fields_dict)  # TODO: support using 'checkpoint'.
     tally_parameters(model)
     check_save_model_path()
 
@@ -345,7 +633,7 @@ def main():
     optim = build_optim(model)  # TODO: support using 'checkpoint'.
 
     # Do training.
-    train_model(model, fields, optim, data_type='multi', model_opt=model_opt)
+    train_model(model, fields_dict, optim, data_type='multi', model_opt=model_opt)
 
     # end
 
