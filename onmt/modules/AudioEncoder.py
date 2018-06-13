@@ -24,6 +24,11 @@ class AudioEncoder(nn.Module):
         self.num_directions = 2 if bidirectional else 1
         self.hidden_size = rnn_size
 
+        # Modified by fut.
+        assert rnn_size % self.num_directions == 0
+        self.hidden_size = rnn_size // self.num_directions
+
+
         self.layer1 = nn.Conv2d(1,   32, kernel_size=(41, 11),
                                 padding=(0, 10), stride=(2, 2))
         self.batch_norm1 = nn.BatchNorm2d(32)
@@ -35,7 +40,13 @@ class AudioEncoder(nn.Module):
         input_size = int(math.floor(input_size - 41) / 2 + 1)
         input_size = int(math.floor(input_size - 21) / 2 + 1)
         input_size *= 32
-        self.rnn = nn.LSTM(input_size, rnn_size,
+
+        # self.rnn = nn.LSTM(input_size, rnn_size,
+        #                    num_layers=num_layers,
+        #                    dropout=dropout,
+        #                    bidirectional=bidirectional)
+        # Modified by fut.
+        self.rnn = nn.LSTM(input_size, self.hidden_size,
                            num_layers=num_layers,
                            dropout=dropout,
                            bidirectional=bidirectional)
