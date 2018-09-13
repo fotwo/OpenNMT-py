@@ -1,15 +1,22 @@
-import onmt.io
-import onmt.translate
-import onmt.Models
-import onmt.Loss
-from onmt.Trainer import Trainer, Statistics
-from onmt.Optim import Optim
+""" Main entry point of the ONMT library """
+from __future__ import division, print_function
 
-# add by NO42.
-# for pycharm reading.
+
+import onmt.inputters
+import onmt.encoders
+import onmt.decoders
+import onmt.models
+import onmt.utils
 import onmt.modules
+from onmt.trainer import Trainer
+import sys
+import onmt.utils.optimizers
+onmt.utils.optimizers.Optim = onmt.utils.optimizers.Optimizer
+sys.modules["onmt.Optim"] = onmt.utils.optimizers
 
+# For Flake
+__all__ = [onmt.inputters, onmt.encoders, onmt.decoders, onmt.models,
+           onmt.utils, onmt.modules, "Trainer"]
 
-# For flake8 compatibility
-__all__ = [onmt.Loss, onmt.Models,
-           Trainer, Optim, Statistics, onmt.io, onmt.translate]
+__version__ = "0.2.0"
+
